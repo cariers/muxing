@@ -4,5 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A simple muxing library for Rust"
+repository = "https://github.com/cariers/muxing"
+documentation = "https://docs.rs/muxing"
+readme = "README.md"
+keywords = ["muxing", "network", "protocol", "multiplex"]
+categories = ["network-programming"]
 
 [dependencies]
