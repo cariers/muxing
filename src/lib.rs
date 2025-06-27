@@ -15,14 +15,12 @@ pub type Result<T> = std::result::Result<T, ConnectionError>;
 pub struct Config {
     max_num_streams: usize,
     max_frame_size: u32,
-    max_ack_backlog: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             max_num_streams: 512,
-            max_ack_backlog: 512,
             max_frame_size: DEFAULT_FRAME_SIZE,
         }
     }
@@ -42,10 +40,6 @@ impl Config {
         self.max_frame_size = max_frame_size;
         self
     }
-    pub fn max_ack_backlog(&mut self, max_ack_backlog: usize) -> &Self {
-        self.max_ack_backlog = max_ack_backlog;
-        self
-    }
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -63,15 +57,12 @@ mod tests {
         let config = Config::new();
         assert_eq!(config.max_num_streams, 512);
         assert_eq!(config.max_frame_size, DEFAULT_FRAME_SIZE);
-        assert_eq!(config.max_ack_backlog, 512);
 
         let mut config = Config::new();
         config.max_num_streams(1024);
         config.max_frame_size(16 * 1024);
-        config.max_ack_backlog(1024);
 
         assert_eq!(config.max_num_streams, 1024);
         assert_eq!(config.max_frame_size, 16 * 1024);
-        assert_eq!(config.max_ack_backlog, 1024);
     }
 }

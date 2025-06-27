@@ -66,9 +66,9 @@ where
                     Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
                         this.pending_frames.push_back(frame);
                     }
-                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
+                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream)))) => {
                         // 关闭流
-                        this.pending_frames.push_back(Frame::new_close(id, ack));
+                        this.pending_frames.push_back(Frame::new_close(id));
                     }
                     Poll::Ready(Some((_, None))) => {}
                     Poll::Pending | Poll::Ready(None) => {

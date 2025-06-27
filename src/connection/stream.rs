@@ -1,8 +1,5 @@
 use super::{ConnectionId, StreamCommand};
-use crate::{
-    Config, StreamId,
-    frame::{Flags, Frame},
-};
+use crate::{Config, StreamId, frame::Frame};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{AsyncRead, AsyncWrite, SinkExt, channel::mpsc, ready};
 use parking_lot::{Mutex, MutexGuard};
@@ -16,7 +13,7 @@ use tracing::{debug, trace};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum State {
-    Open { ack: bool },
+    Open,
     SendClosed,
     RecvClosed,
     Closed,
@@ -31,17 +28,8 @@ impl State {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Flag {
-    /// The stream was opened lazily, so set the initial SYN flag.
-    Syn,
-    /// The stream still needs acknowledgement, so set the ACK flag.
-    Ack,
-}
-
 pub struct Stream {
     id: StreamId,
-    flag: Option<Flag>,
     connection_id: ConnectionId,
     config: Arc<Config>,
     sender: mpsc::Sender<StreamCommand>,
@@ -72,7 +60,6 @@ impl Stream {
     ) -> Self {
         Self {
             id,
-            flag: Some(Flag::Ack),
             connection_id,
             config,
             sender,
@@ -88,7 +75,6 @@ impl Stream {
     ) -> Self {
         Self {
             id,
-            flag: Some(Flag::Syn),
             connection_id,
             config,
             sender,
@@ -186,18 +172,8 @@ impl AsyncWrite for Stream {
             Bytes::copy_from_slice(buf)
         };
         let n = payload.len();
-        let mut frame = Frame::new_data(self.id, payload);
-        match self.flag.take() {
-            Some(Flag::Syn) => frame.header_mut().syn(),
-            Some(Flag::Ack) => frame.header_mut().ack(),
-            None => {}
-        };
+        let frame = Frame::new_data(self.id, payload);
         trace!("{}/{}: write {} bytes", self.connection_id, self.id, n);
-        if frame.header().flags().contains(Flags::ACK) {
-            // 切换到ACK状态
-            self.shared()
-                .update_state(self.connection_id, self.id, State::Open { ack: true });
-        }
         let cmd = StreamCommand::SendFrame(frame);
         self.sender
             .start_send(cmd)
@@ -216,15 +192,8 @@ impl AsyncWrite for Stream {
             return Poll::Ready(Ok(()));
         }
         ready!(self.sender.poll_ready(cx)).map_err(|_| self.write_zero_err())?;
-
-        let ack = if self.flag == Some(Flag::Ack) {
-            self.flag.take();
-            true
-        } else {
-            false
-        };
         trace!("{}/{}: close", self.connection_id, self.id);
-        let cmd = StreamCommand::CloseStream { ack };
+        let cmd = StreamCommand::CloseStream;
         self.sender
             .start_send(cmd)
             .map_err(|_| self.write_zero_err())?;
@@ -246,7 +215,7 @@ pub(crate) struct Shared {
 impl Shared {
     fn new() -> Self {
         Self {
-            state: State::Open { ack: false },
+            state: State::Open,
             buffer: BytesMut::new(),
             reader: None,
             writer: None,
@@ -255,10 +224,6 @@ impl Shared {
 
     pub fn state(&self) -> State {
         self.state
-    }
-
-    pub fn is_pending_ack(&self) -> bool {
-        matches!(self.state(), State::Open { ack: false })
     }
 
     pub(crate) fn update_state(&mut self, cid: ConnectionId, sid: StreamId, next: State) -> State {

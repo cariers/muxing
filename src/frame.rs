@@ -41,9 +41,7 @@ impl fmt::Display for StreamId {
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Flags: u8 {
-        const SYN = 0x1;
-        const ACK = 0x2;
-        const FIN = 0x4;
+        const FIN = 0x1;
         const RST = 0x8;
     }
 }
@@ -70,7 +68,7 @@ impl fmt::Display for Header {
 impl Header {
     pub fn new(id: StreamId, length: u32) -> Self {
         Header {
-            version: 0,
+            version: 0x1,
             flags: Flags::empty(),
             reserved: 0,
             stream_id: id,
@@ -82,16 +80,8 @@ impl Header {
         self.stream_id
     }
 
-    pub fn syn(&mut self) {
-        self.flags.insert(Flags::SYN)
-    }
-
     pub fn fin(&mut self) {
         self.flags.insert(Flags::FIN);
-    }
-
-    pub fn ack(&mut self) {
-        self.flags.insert(Flags::ACK);
     }
 
     pub fn rst(&mut self) {
@@ -158,14 +148,6 @@ impl Frame {
         &mut self.header
     }
 
-    pub fn data(&self) -> &Bytes {
-        &self.data
-    }
-
-    pub fn data_mut(&mut self) -> &mut Bytes {
-        &mut self.data
-    }
-
     pub fn into_data(self) -> Bytes {
         self.data
     }
@@ -174,11 +156,9 @@ impl Frame {
         (self.header, self.data)
     }
 
-    pub fn new_close(id: StreamId, ack: bool) -> Self {
+    pub fn new_close(id: StreamId) -> Self {
         let mut frame = Frame::new_empty(id);
-        if ack {
-            frame.header.ack();
-        }
+        frame.header_mut().fin();
         frame
     }
 }

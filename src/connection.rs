@@ -61,7 +61,7 @@ impl fmt::Display for ConnectionId {
 #[derive(Debug)]
 pub(crate) enum StreamCommand {
     SendFrame(Frame),
-    CloseStream { ack: bool },
+    CloseStream,
 }
 
 #[derive(Debug)]
@@ -323,20 +323,12 @@ where
         }
     }
 
-    fn poll_new_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
+    fn poll_new_outbound(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Stream>> {
         if self.streams.len() >= self.config.max_num_streams {
             error!(
                 "{}: maximum({}) number of streams reached",
                 self.id, self.config.max_num_streams
             );
-            return Poll::Ready(Err(ConnectionError::TooManyStreams));
-        }
-        if self.ack_backlog() >= self.config.max_ack_backlog {
-            debug!(
-                "{}: streams({}) waiting for ACK, task for wake-up",
-                self.id, self.config.max_ack_backlog
-            );
-            self.new_outbound_stream_waker = Some(cx.waker().clone());
             return Poll::Ready(Err(ConnectionError::TooManyStreams));
         }
         trace!("{}: creating new outbound stream", self.id);
@@ -377,17 +369,6 @@ where
             Endpoint::Server => assert!(proposed.is_server()),
         }
         Ok(proposed)
-    }
-
-    fn ack_backlog(&mut self) -> usize {
-        self.streams
-            .iter()
-            .filter(|(id, _)| match self.endpoint {
-                Endpoint::Client => id.is_client(),
-                Endpoint::Server => id.is_server(),
-            })
-            .filter(|(_, s)| s.lock().is_pending_ack())
-            .count()
     }
 
     fn is_valid_remote_id(&self, id: StreamId) -> bool {
@@ -437,9 +418,9 @@ where
                         self.pending_write_frame.replace(frame);
                         continue;
                     }
-                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
+                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream)))) => {
                         trace!("{}/{}: sending close", self.id, id);
-                        self.pending_write_frame.replace(Frame::new_close(id, ack));
+                        self.pending_write_frame.replace(Frame::new_close(id));
                     }
                     Poll::Ready(Some((id, None))) => {
                         if let Some(frame) = self.on_drop_stream(id) {
@@ -480,17 +461,6 @@ where
     fn on_frame(&mut self, frame: Frame) -> Result<Action> {
         trace!("{}: received: {}", self.id, frame.header());
         let stream_id = frame.header().stream_id();
-        if frame.header().flags().contains(Flags::ACK) {
-            // ACK Frame
-            if let Some(stream) = self.streams.get(&stream_id) {
-                stream
-                    .lock()
-                    .update_state(self.id, stream_id, State::Open { ack: true });
-            }
-            if let Some(waker) = self.new_outbound_stream_waker.take() {
-                waker.wake();
-            }
-        }
         if frame.header().flags().contains(Flags::RST) {
             if let Some(s) = self.streams.get_mut(&stream_id) {
                 let mut shared = s.lock();
@@ -505,7 +475,8 @@ where
             return Ok(Action::None);
         }
         let is_finish = frame.header().flags().contains(Flags::FIN); // 流半关闭
-        if frame.header().flags().contains(Flags::SYN) {
+
+        if self.streams.get(&stream_id).is_none() {
             // 新建流
             if !self.is_valid_remote_id(stream_id) {
                 error!("{}: invalid stream id {}", self.id, stream_id);

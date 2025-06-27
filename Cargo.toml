@@ -1,6 +1,6 @@
 [package]
 name = "muxing"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "A simple muxing library for Rust"
@@ -12,10 +12,10 @@ categories = ["network-programming"]
 
 [dependencies]
 asynchronous-codec = "0.7.0"
-bitflags = "2.9.0"
+bitflags = "2.9.1"
 bytes = "1.10.1"
 futures = "0.3.31"
-parking_lot = "0.12.3"
+parking_lot = "0.12.4"
 pin-project = "1.1.10"
 thiserror = "2.0.12"
 tracing = "0.1.41"
