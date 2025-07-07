@@ -1,31 +1,37 @@
+use std::io;
+
 #[derive(Debug, thiserror::Error)]
-pub enum HeaderDecodeError {
-    #[error("Invalid header version({0})")]
-    Version(u8),
-    #[error("Invalid header flags")]
-    Flags,
+pub enum ConnectionError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("Decode error: {0}")]
+    Decode(#[from] FrameDecodeError),
+    #[error("No more stream IDs available")]
+    NoMoreStreamIds,
+    #[error("Connection is closed")]
+    Closed,
+    #[error("Maximum number of active streams")]
+    TooManyStreams,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameDecodeError {
-    #[error(transparent)]
-    Header(#[from] HeaderDecodeError),
+    #[error("Unknown version: {0}")]
+    Version(u8),
+    #[error("Frame length is too large, expected at most {1}, got {0}")]
+    TooLarge(usize, usize),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("frame body is too large ({0})")]
-    FrameTooLarge(usize),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ConnectionError {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Decode(#[from] FrameDecodeError),
-    #[error("number of stream ids has been exhausted")]
-    NoMoreStreamIds,
-    #[error("maximum number of streams reached")]
-    TooManyStreams,
-    #[error("connection is closed")]
-    Closed,
+impl From<futures::channel::mpsc::SendError> for ConnectionError {
+    fn from(_: futures::channel::mpsc::SendError) -> Self {
+        ConnectionError::Closed
+    }
+}
+
+impl From<futures::channel::oneshot::Canceled> for ConnectionError {
+    fn from(_: futures::channel::oneshot::Canceled) -> Self {
+        ConnectionError::Closed
+    }
 }

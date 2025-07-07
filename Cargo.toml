@@ -11,11 +11,11 @@ keywords = ["muxing", "network", "protocol", "multiplex"]
 categories = ["network-programming"]
 
 [dependencies]
-asynchronous-codec = "0.7.0"
-bitflags = "2.9.1"
 bytes = "1.10.1"
 futures = "0.3.31"
+nohash-hasher = "0.2.0"
 parking_lot = "0.12.4"
 pin-project = "1.1.10"
+rand = "0.9.1"
 thiserror = "2.0.12"
 tracing = "0.1.41"

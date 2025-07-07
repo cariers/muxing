@@ -1,5 +1,4 @@
-use super::{StreamCommand, stream::TaggedStream};
-use crate::{ConnectionError, StreamId};
+use crate::{ConnectionError, StreamId, connection::StreamCommand, tagged_stream::TaggedStream};
 use futures::{StreamExt, channel::mpsc, stream::SelectAll};
 use std::{
     pin::Pin,
@@ -7,7 +6,9 @@ use std::{
 };
 
 enum State {
+    /// 关闭stream接收
     ClosingStreamReceiver,
+    /// 排干stream接收
     DrainingStreamReceiver,
 }
 
@@ -32,23 +33,30 @@ impl Cleanup {
 
 impl Future for Cleanup {
     type Output = ConnectionError;
-
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // 获取Pin inner可变引用
         let this = self.get_mut();
         loop {
             match this.state {
                 State::ClosingStreamReceiver => {
-                    this.stream_receivers
-                        .iter_mut()
-                        .for_each(|s| s.inner_mut().close());
+                    for stream in this.stream_receivers.iter_mut() {
+                        stream.inner_mut().close();
+                    }
+                    // 切换到 排干接收器
                     this.state = State::DrainingStreamReceiver;
                 }
                 State::DrainingStreamReceiver => match this.stream_receivers.poll_next_unpin(cx) {
                     Poll::Ready(Some(cmd)) => {
+                        // drop send command
                         drop(cmd);
                     }
                     Poll::Ready(None) | Poll::Pending => {
-                        return Poll::Ready(this.error.take().unwrap_or(ConnectionError::Closed));
+                        // 返回错误
+                        return Poll::Ready(
+                            this.error
+                                .take()
+                                .expect("to not be called after completion"),
+                        );
                     }
                 },
             }

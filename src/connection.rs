@@ -1,9 +1,18 @@
+mod cleanup;
+mod closing;
+mod stream;
+
+pub use stream::Stream;
+
 use crate::{
-    Config, ConnectionError, Result, StreamId,
-    frame::{Codec, Flags, Frame, Header},
+    Config, ConnectionError, MAX_ACK_BACKLOG, Result, StreamId,
+    connection::stream::State,
+    frame::{
+        self, Frame,
+        header::{self, Header},
+    },
+    tagged_stream::TaggedStream,
 };
-use asynchronous_codec::Framed;
-use bytes::Bytes;
 use cleanup::Cleanup;
 use closing::Closing;
 use futures::{
@@ -11,71 +20,57 @@ use futures::{
     channel::mpsc,
     stream::{Fuse, SelectAll},
 };
+use nohash_hasher::IntMap;
 use parking_lot::Mutex;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
-use stream::{Shared, State, TaggedStream};
-use tracing::{debug, error, trace, warn};
 
-mod cleanup;
-mod closing;
-mod stream;
-
-pub use stream::Stream;
-
-#[allow(dead_code)]
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Endpoint {
+    /// Client to server connection.
     Client,
+    /// Server to client connection.
     Server,
 }
 
-#[allow(dead_code)]
-const NEXT_CONNECTION_ID: AtomicUsize = AtomicUsize::new(1);
-
 #[derive(Clone, Copy)]
-pub(crate) struct ConnectionId(usize);
+pub(crate) struct ConnectionId(u32);
 
 impl ConnectionId {
-    pub(crate) fn new() -> Self {
-        Self(NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    pub(crate) fn random() -> Self {
+        ConnectionId(rand::random())
     }
 }
 
 impl fmt::Debug for ConnectionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:08x}", self.0)
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "0x{:08x}", self.0)
     }
 }
 
 impl fmt::Display for ConnectionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:08x}", self.0)
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "0x{:08x}", self.0)
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum StreamCommand {
+    /// 发送数据帧
     SendFrame(Frame),
-    CloseStream,
-}
-
-#[derive(Debug)]
-pub(crate) enum Action {
-    None,
-    New(Stream),
-    Terminate,
+    /// 关闭流
+    CloseStream { ack: bool },
 }
 
 enum ConnectionState<T> {
     Active(Active<T>),
     Closing(Closing<T>),
-    Closed,
     Cleanup(Cleanup),
+    Closed,
     Poisoned,
 }
 
@@ -97,10 +92,9 @@ pub struct Connection<T> {
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
-    pub fn new(socket: T, endpoint: Endpoint, config: Config) -> Self {
-        Self {
-            inner: ConnectionState::Active(Active::new(socket, endpoint, config)),
-        }
+    pub fn new(socket: T, config: Config, endpoint: Endpoint) -> Self {
+        let inner = ConnectionState::Active(Active::new(socket, config, endpoint));
+        Self { inner }
     }
 
     pub fn poll_new_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
@@ -111,16 +105,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         self.inner = ConnectionState::Active(active);
                         return Poll::Ready(Ok(stream));
                     }
-                    Poll::Ready(Err(e)) => {
-                        self.inner = ConnectionState::Cleanup(active.cleanup(e));
-                        continue;
-                    }
                     Poll::Pending => {
                         self.inner = ConnectionState::Active(active);
                         return Poll::Pending;
                     }
+                    Poll::Ready(Err(e)) => {
+                        self.inner = ConnectionState::Cleanup(active.cleanup(e));
+                        continue;
+                    }
                 },
-                ConnectionState::Closing(mut closing) => match closing.poll_unpin(cx) {
+                ConnectionState::Closing(mut inner) => match inner.poll_unpin(cx) {
                     Poll::Ready(Ok(())) => {
                         self.inner = ConnectionState::Closed;
                         return Poll::Ready(Err(ConnectionError::Closed));
@@ -130,17 +124,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         return Poll::Ready(Err(e));
                     }
                     Poll::Pending => {
-                        self.inner = ConnectionState::Closing(closing);
+                        self.inner = ConnectionState::Closing(inner);
                         return Poll::Pending;
                     }
                 },
-                ConnectionState::Cleanup(mut cleanup) => match cleanup.poll_unpin(cx) {
+                ConnectionState::Cleanup(mut inner) => match inner.poll_unpin(cx) {
                     Poll::Ready(e) => {
                         self.inner = ConnectionState::Closed;
                         return Poll::Ready(Err(e));
                     }
                     Poll::Pending => {
-                        self.inner = ConnectionState::Cleanup(cleanup);
+                        self.inner = ConnectionState::Cleanup(inner);
                         return Poll::Pending;
                     }
                 },
@@ -172,7 +166,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 },
                 ConnectionState::Closing(mut closing) => match closing.poll_unpin(cx) {
                     Poll::Ready(Ok(())) => {
-                        // 关闭连接成功
                         self.inner = ConnectionState::Closed;
                         return Poll::Ready(None);
                     }
@@ -187,13 +180,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                 },
                 ConnectionState::Cleanup(mut cleanup) => match cleanup.poll_unpin(cx) {
                     Poll::Ready(ConnectionError::Closed) => {
-                        // 关闭连接成功
                         self.inner = ConnectionState::Closed;
                         return Poll::Ready(None);
                     }
-                    Poll::Ready(e) => {
+                    Poll::Ready(other) => {
                         self.inner = ConnectionState::Closed;
-                        return Poll::Ready(Some(Err(e)));
+                        return Poll::Ready(Some(Err(other)));
                     }
                     Poll::Pending => {
                         self.inner = ConnectionState::Cleanup(cleanup);
@@ -208,32 +200,32 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
             }
         }
     }
+
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         loop {
             match std::mem::replace(&mut self.inner, ConnectionState::Poisoned) {
                 ConnectionState::Active(active) => {
                     self.inner = ConnectionState::Closing(active.close());
                 }
-                ConnectionState::Closing(mut closing) => match closing.poll_unpin(cx) {
+                ConnectionState::Closing(mut inner) => match inner.poll_unpin(cx) {
                     Poll::Ready(Ok(())) => {
                         self.inner = ConnectionState::Closed;
-                        return Poll::Ready(Ok(()));
                     }
                     Poll::Ready(Err(e)) => {
-                        warn!("Failure while closing connection: {}", e);
+                        tracing::warn!("Failure while closing connection: {}", e);
                         self.inner = ConnectionState::Closed;
                         return Poll::Ready(Err(e));
                     }
                     Poll::Pending => {
-                        self.inner = ConnectionState::Closing(closing);
+                        self.inner = ConnectionState::Closing(inner);
                         return Poll::Pending;
                     }
                 },
                 ConnectionState::Cleanup(mut cleanup) => match cleanup.poll_unpin(cx) {
-                    Poll::Ready(e) => {
-                        warn!("Failure while closing connection: {}", e);
+                    Poll::Ready(reason) => {
+                        tracing::warn!("Failure while closing connection: {}", reason);
                         self.inner = ConnectionState::Closed;
-                        return Poll::Ready(Err(e));
+                        return Poll::Ready(Ok(()));
                     }
                     Poll::Pending => {
                         self.inner = ConnectionState::Cleanup(cleanup);
@@ -244,7 +236,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                     self.inner = ConnectionState::Closed;
                     return Poll::Ready(Ok(()));
                 }
-                ConnectionState::Poisoned => unreachable!(),
+                ConnectionState::Poisoned => {
+                    unreachable!()
+                }
             }
         }
     }
@@ -266,9 +260,10 @@ struct Active<T> {
     id: ConnectionId,
     endpoint: Endpoint,
     config: Arc<Config>,
+    socket: Fuse<frame::Framed<T>>,
     next_id: u32,
-    socket: Fuse<Framed<T, Codec>>,
-    streams: HashMap<StreamId, Arc<Mutex<Shared>>>,
+
+    streams: IntMap<StreamId, Arc<Mutex<stream::Shared>>>,
     stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
     no_streams_waker: Option<Waker>,
 
@@ -300,22 +295,23 @@ impl<T> fmt::Display for Active<T> {
     }
 }
 
-impl<T> Active<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    fn new(socket: T, endpoint: Endpoint, config: Config) -> Self {
-        let id = ConnectionId::new();
-        let socket = Framed::new(socket, Codec::new(config.max_frame_size)).fuse();
-        let next_id = if endpoint == Endpoint::Client { 1 } else { 2 };
+impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
+    fn new(socket: T, config: Config, endpoint: Endpoint) -> Self {
+        let id = ConnectionId::random();
+        tracing::debug!("Creating new connection: {} (endpoint: {:?})", id, endpoint);
+        let socket = frame::Framed::new(id, socket).fuse();
+        let next_id = match endpoint {
+            Endpoint::Client => 1,
+            Endpoint::Server => 2,
+        };
         Self {
             id,
             endpoint,
             config: Arc::new(config),
-            next_id,
             socket,
-            streams: HashMap::new(),
-            stream_receivers: SelectAll::default(),
+            next_id,
+            streams: IntMap::default(),
+            stream_receivers: SelectAll::new(),
             no_streams_waker: None,
             pending_read_frame: None,
             pending_write_frame: None,
@@ -323,24 +319,129 @@ where
         }
     }
 
-    fn poll_new_outbound(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Stream>> {
-        if self.streams.len() >= self.config.max_num_streams {
-            error!(
-                "{}: maximum({}) number of streams reached",
-                self.id, self.config.max_num_streams
-            );
+    fn close(self) -> Closing<T> {
+        let pending_frames = self
+            .pending_write_frame
+            .into_iter()
+            .collect::<VecDeque<Frame>>();
+        Closing::new(self.stream_receivers, pending_frames, self.socket)
+    }
+
+    fn cleanup(mut self, error: ConnectionError) -> Cleanup {
+        self.drop_all_streams();
+        Cleanup::new(self.stream_receivers, error)
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
+        loop {
+            if self.socket.poll_ready_unpin(cx).is_ready() {
+                if let Some(frame) = self
+                    .pending_read_frame
+                    .take()
+                    .or_else(|| self.pending_write_frame.take())
+                {
+                    self.socket.start_send_unpin(frame)?;
+                }
+            }
+            match self.socket.poll_flush_unpin(cx)? {
+                Poll::Ready(()) => {}
+                Poll::Pending => {}
+            }
+            if self.pending_write_frame.is_none() {
+                match self.stream_receivers.poll_next_unpin(cx) {
+                    Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
+                        tracing::trace!(
+                            "Stream({}/{}): sending: {}",
+                            self.id,
+                            frame.header().stream_id(),
+                            frame.header()
+                        );
+                        self.pending_write_frame.replace(frame);
+                        continue;
+                    }
+                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
+                        tracing::trace!("Stream({}/{}): closing", self.id, id);
+                        self.pending_write_frame
+                            .replace(Frame::new_close_stream(id, ack));
+                        continue;
+                    }
+                    Poll::Ready(Some((id, None))) => {
+                        // 关闭流
+                        if let Some(frame) = self.on_drop_stream(id) {
+                            tracing::trace!(
+                                "Stream({}/{}): sending: {}",
+                                self.id,
+                                id,
+                                frame.header()
+                            );
+                            self.pending_write_frame.replace(frame);
+                        }
+                        continue;
+                    }
+                    Poll::Ready(None) => {
+                        self.no_streams_waker = Some(cx.waker().clone());
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            // 轮询底层Socket以接收数据帧
+
+            if self.pending_read_frame.is_none() {
+                match self.socket.poll_next_unpin(cx) {
+                    Poll::Ready(Some(frame)) => {
+                        match self.on_frame(frame?)? {
+                            Action::None => {}
+                            Action::New(stream) => {
+                                tracing::trace!("{}: new stream created", stream);
+                                return Poll::Ready(Ok(stream));
+                            }
+                            Action::Terminate(frame) => {
+                                tracing::trace!(
+                                    "Connection({}): terminating connection with frame: {}",
+                                    self.id,
+                                    frame.header()
+                                );
+                                self.pending_read_frame.replace(frame);
+                            }
+                        };
+                        continue;
+                    }
+                    Poll::Ready(None) => {
+                        return Poll::Ready(Err(ConnectionError::Closed));
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            return Poll::Pending;
+        }
+    }
+
+    fn poll_new_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
+        if self.streams.len() >= self.config.max_active_streams {
+            tracing::error!("{}: maximum number of streams reached", self.id);
             return Poll::Ready(Err(ConnectionError::TooManyStreams));
         }
-        trace!("{}: creating new outbound stream", self.id);
+        if self.ack_backlog() >= MAX_ACK_BACKLOG {
+            tracing::debug!(
+                "{MAX_ACK_BACKLOG} streams waiting for ACK, registering task for wake-up until remote acknowledges at least one stream"
+            );
+            self.new_outbound_stream_waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        tracing::trace!("Connection({}): creating new outbound stream", self.id);
+
         let id = self.next_stream_id()?;
         let stream = self.make_new_outbound_stream(id);
-        debug!("{}: new outbound {} of {}", self.id, id, self);
+        tracing::debug!("{}: new outbound stream", stream);
+        self.streams.insert(id, stream.clone_shared());
         Poll::Ready(Ok(stream))
     }
 
     fn make_new_outbound_stream(&mut self, id: StreamId) -> Stream {
         let config = self.config.clone();
-        let (sender, receiver) = mpsc::channel(10);
+
+        let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
         self.stream_receivers.push(TaggedStream::new(id, receiver));
         if let Some(waker) = self.no_streams_waker.take() {
             waker.wake();
@@ -348,14 +449,15 @@ where
         Stream::new_outbound(id, self.id, config, sender)
     }
 
-    fn make_new_inbound_stream(&mut self, id: StreamId) -> Stream {
-        let config = self.config.clone();
-        let (sender, receiver) = mpsc::channel(10);
-        self.stream_receivers.push(TaggedStream::new(id, receiver));
-        if let Some(waker) = self.no_streams_waker.take() {
-            waker.wake();
-        }
-        Stream::new_inbound(id, self.id, config, sender)
+    fn ack_backlog(&mut self) -> usize {
+        self.streams
+            .iter()
+            .filter(|(id, _)| match self.endpoint {
+                Endpoint::Client => id.is_client(),
+                Endpoint::Server => id.is_server(),
+            })
+            .filter(|(_, s)| s.lock().is_pending_ack())
+            .count()
     }
 
     fn next_stream_id(&mut self) -> Result<StreamId> {
@@ -371,189 +473,174 @@ where
         Ok(proposed)
     }
 
+    fn on_drop_stream(&mut self, stream_id: StreamId) -> Option<Frame> {
+        let s = self.streams.remove(&stream_id).expect("stream not found");
+        tracing::trace!(
+            "Connection({}): removing dropped stream {}",
+            self.id,
+            stream_id
+        );
+        let frame = {
+            let mut shared = s.lock();
+            let frame = match shared.update_state(State::Closed) {
+                State::Open { .. } => {
+                    let mut header = Header::data(stream_id, 0);
+                    header.rst();
+                    Some(Frame::new(header))
+                }
+                State::RecvClosed => {
+                    let mut header = Header::data(stream_id, 0);
+                    header.fin();
+                    Some(Frame::new(header))
+                }
+                State::SendClosed | State::Closed => None,
+            };
+            if let Some(w) = shared.reader.take() {
+                w.wake()
+            }
+            if let Some(w) = shared.writer.take() {
+                w.wake()
+            }
+            frame
+        };
+        frame
+    }
+
+    fn on_frame(&mut self, frame: Frame) -> Result<Action> {
+        tracing::trace!(
+            "Connection({}): received frame: {}",
+            self.id,
+            frame.header()
+        );
+        if frame.header().flags().contains(header::ACK) {
+            let id = frame.header().stream_id();
+            if let Some(stream) = self.streams.get(&id) {
+                stream
+                    .lock()
+                    .update_state(State::Open { acknowledged: true });
+            }
+            if let Some(waker) = self.new_outbound_stream_waker.take() {
+                waker.wake();
+            }
+        }
+        // 处理终止帧
+        if frame.is_termination() {
+            return Err(ConnectionError::Closed);
+        }
+        Ok(self.on_data(frame))
+    }
+
+    fn on_data(&mut self, frame: Frame) -> Action {
+        let stream_id = frame.header().stream_id();
+        // 读取到重置流
+        if frame.header().flags().contains(header::RST) {
+            if let Some(s) = self.streams.get_mut(&stream_id) {
+                let mut shared = s.lock();
+                // 强制切换到 Closed 状态
+                shared.update_state(State::Closed);
+                if let Some(w) = shared.reader.take() {
+                    w.wake();
+                }
+                if let Some(w) = shared.writer.take() {
+                    w.wake()
+                }
+            }
+        }
+
+        let is_finish = frame.header().flags().contains(header::FIN);
+
+        if frame.header().flags().contains(header::SYN) {
+            if !self.is_valid_remote_id(stream_id) {
+                tracing::error!(
+                    "Connection({}): invalid remote stream id: {}",
+                    self.id,
+                    stream_id
+                );
+                return Action::Terminate(Frame::new_protocol_error());
+            }
+            // 流已经存在
+            if self.streams.contains_key(&stream_id) {
+                tracing::error!(
+                    "Connection({}): stream {} already exists",
+                    self.id,
+                    stream_id
+                );
+                return Action::Terminate(Frame::new_protocol_error());
+            }
+            // 检查是否超过最大活动流数
+            if self.streams.len() == self.config.max_active_streams {
+                tracing::warn!("Connection({}): maximum number of streams reached", self.id);
+                return Action::Terminate(Frame::new_protocol_error());
+            }
+            let stream = self.make_new_inbound_stream(stream_id);
+            {
+                let mut shared = stream.shared();
+                if is_finish {
+                    shared.update_state(State::RecvClosed);
+                }
+                //写入首包数据
+                shared.buffer.extend(frame.into_body());
+            }
+            self.streams.insert(stream_id, stream.clone_shared());
+            return Action::New(stream);
+        }
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            let mut shared = s.lock();
+            if is_finish {
+                shared.update_state(State::RecvClosed);
+            }
+            shared.buffer.extend(frame.into_body());
+            // 唤醒等待读取的任务
+            if let Some(w) = shared.reader.take() {
+                w.wake()
+            }
+        } else {
+            tracing::warn!(
+                "Connection({}): received frame for unknown stream: {}",
+                self.id,
+                stream_id
+            );
+        }
+        Action::None
+    }
+
+    fn make_new_inbound_stream(&mut self, id: StreamId) -> Stream {
+        let config = self.config.clone();
+        // 缓存10个包
+        let (sender, receiver) = mpsc::channel(10);
+        self.stream_receivers.push(TaggedStream::new(id, receiver));
+        if let Some(waker) = self.no_streams_waker.take() {
+            waker.wake();
+        }
+        Stream::new_inbound(id, self.id, config, sender)
+    }
+
     fn is_valid_remote_id(&self, id: StreamId) -> bool {
         match self.endpoint {
             Endpoint::Client => id.is_server(),
             Endpoint::Server => id.is_client(),
         }
     }
-
-    fn close(self) -> Closing<T> {
-        let pending_frames = self
-            .pending_read_frame
-            .into_iter()
-            .chain(self.pending_write_frame)
-            .collect::<VecDeque<Frame>>();
-        Closing::new(self.stream_receivers, pending_frames, self.socket)
-    }
-
-    fn cleanup(mut self, error: ConnectionError) -> Cleanup {
-        self.drop_all_streams();
-        Cleanup::new(self.stream_receivers, error)
-    }
-
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
-        loop {
-            if self.socket.poll_ready_unpin(cx).is_ready() {
-                //Socket is ready to send
-                if let Some(frame) = self
-                    .pending_read_frame
-                    .take()
-                    .or_else(|| self.pending_write_frame.take())
-                {
-                    self.socket.start_send_unpin(frame)?;
-                    continue;
-                }
-            }
-            // Flush the socket
-            match self.socket.poll_flush_unpin(cx)? {
-                Poll::Ready(()) => {}
-                Poll::Pending => {}
-            }
-
-            if self.pending_write_frame.is_none() {
-                match self.stream_receivers.poll_next_unpin(cx) {
-                    Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
-                        trace!("{}/{}: sending frame", self.id, frame.header().stream_id());
-                        self.pending_write_frame.replace(frame);
-                        continue;
-                    }
-                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream)))) => {
-                        trace!("{}/{}: sending close", self.id, id);
-                        self.pending_write_frame.replace(Frame::new_close(id));
-                    }
-                    Poll::Ready(Some((id, None))) => {
-                        if let Some(frame) = self.on_drop_stream(id) {
-                            self.pending_write_frame.replace(frame);
-                        }
-                        continue;
-                    }
-                    Poll::Ready(None) => {
-                        self.new_outbound_stream_waker = Some(cx.waker().clone());
-                    }
-                    Poll::Pending => {}
-                }
-            }
-
-            if self.pending_read_frame.is_none() {
-                match self.socket.poll_next_unpin(cx) {
-                    Poll::Ready(Some(frame)) => match self.on_frame(frame?)? {
-                        Action::New(stream) => {
-                            trace!("{}: new inbound {} of {}", self.id, stream, self);
-                            return Poll::Ready(Ok(stream));
-                        }
-                        Action::Terminate => {
-                            trace!("{}: sending close", self.id);
-                            return Poll::Ready(Err(ConnectionError::Closed));
-                        }
-                        Action::None => {}
-                    },
-                    Poll::Ready(None) => {
-                        return Poll::Ready(Err(ConnectionError::Closed));
-                    }
-                    Poll::Pending => {}
-                }
-            }
-            return Poll::Pending;
-        }
-    }
-
-    fn on_frame(&mut self, frame: Frame) -> Result<Action> {
-        trace!("{}: received: {}", self.id, frame.header());
-        let stream_id = frame.header().stream_id();
-        if frame.header().flags().contains(Flags::RST) {
-            if let Some(s) = self.streams.get_mut(&stream_id) {
-                let mut shared = s.lock();
-                shared.update_state(self.id, stream_id, State::Closed);
-                if let Some(w) = shared.reader.take() {
-                    w.wake()
-                }
-                if let Some(w) = shared.writer.take() {
-                    w.wake()
-                }
-            }
-            return Ok(Action::None);
-        }
-        let is_finish = frame.header().flags().contains(Flags::FIN); // 流半关闭
-
-        if self.streams.get(&stream_id).is_none() {
-            // 新建流
-            if !self.is_valid_remote_id(stream_id) {
-                error!("{}: invalid stream id {}", self.id, stream_id);
-                return Ok(Action::Terminate);
-            }
-            if self.streams.contains_key(&stream_id) {
-                error!("{}: stream {} already exists", self.id, stream_id);
-                return Ok(Action::Terminate);
-            }
-            if self.streams.len() == self.config.max_num_streams {
-                error!(
-                    "{}: maximum({}) number of streams reached",
-                    self.id, self.config.max_num_streams
-                );
-                return Ok(Action::Terminate);
-            }
-            let stream = self.make_new_inbound_stream(stream_id);
-            {
-                let mut shared = stream.shared();
-                if is_finish {
-                    shared.update_state(self.id, stream_id, State::RecvClosed);
-                }
-                shared.buffer.extend_from_slice(&frame.into_data()[..]);
-            };
-            self.streams.insert(stream_id, stream.clone_shared());
-            return Ok(Action::New(stream));
-        }
-        if let Some(s) = self.streams.get_mut(&stream_id) {
-            let mut shared = s.lock();
-            if is_finish {
-                shared.update_state(self.id, stream_id, State::RecvClosed);
-            }
-            shared.buffer.extend_from_slice(&frame.into_data()[..]);
-            if let Some(w) = shared.reader.take() {
-                w.wake()
-            }
-        } else {
-            trace!(
-                "{}/{}: data frame for unknown stream, possibly dropped earlier: {:?}",
-                self.id, stream_id, frame
-            );
-        }
-        Ok(Action::None)
-    }
-
-    fn on_drop_stream(&mut self, stream_id: StreamId) -> Option<Frame> {
-        let s = self.streams.get(&stream_id).expect("stream should exist");
-        trace!("{}: dropping stream {}", self.id, stream_id);
-        let mut shared = s.lock();
-        let state = shared.update_state(self.id, stream_id, State::Closed);
-        match state {
-            State::Open { .. } => {
-                let mut header = Header::new(stream_id, 0);
-                header.rst();
-                Some(Frame::new(header, Bytes::new()))
-            }
-            State::RecvClosed => {
-                let mut header = Header::new(stream_id, 0);
-                header.fin();
-                Some(Frame::new(header, Bytes::new()))
-            }
-            State::SendClosed | State::Closed => None,
-        }
-    }
 }
 
 impl<T> Active<T> {
     fn drop_all_streams(&mut self) {
-        self.streams.drain().for_each(|(sid, s)| {
+        for (_, s) in self.streams.drain() {
             let mut shared = s.lock();
-            shared.update_state(self.id, sid, State::Closed);
-            if let Some(waker) = shared.reader.take() {
-                waker.wake();
+            shared.update_state(State::Closed);
+            if let Some(w) = shared.reader.take() {
+                w.wake()
             }
-            if let Some(waker) = shared.writer.take() {
-                waker.wake();
+            if let Some(w) = shared.writer.take() {
+                w.wake()
             }
-        });
+        }
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum Action {
+    None,
+    New(Stream),
+    Terminate(Frame),
 }
