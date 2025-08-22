@@ -341,6 +341,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                     .or_else(|| self.pending_write_frame.take())
                 {
                     self.socket.start_send_unpin(frame)?;
+                    continue;
                 }
             }
             match self.socket.poll_flush_unpin(cx)? {
